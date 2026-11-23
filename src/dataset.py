@@ -10,11 +10,15 @@ shape expected by ``nn.Conv2d``:
 
 The loader does not use ``torchvision``.  That keeps the dependency list short
 and makes resizing, normalization, and the small training augmentation visible.
+The RGB-to-``C x H x W`` conversion follows Chapter VI.3, Section 2. The random
+horizontal flip is a small companion-code training augmentation, not a CNN
+operation developed in the chapter.
 """
 
 from pathlib import Path
 
 import torch
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -44,20 +48,20 @@ def image_to_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
     resampling = getattr(Image, "Resampling", Image)
 
     # RGB is important even if an input file is grayscale or has transparency:
-    # the first convolution layer is defined with 3 input channels.
-    image = image.convert("RGB").resize((image_size, image_size), resampling.BILINEAR)
+    # the first convolution layer is defined with 3 input channels. Skip the
+    # resize operation when prepare_images.py already made the image this size.
+    image = image.convert("RGB")
+    if image.size != (image_size, image_size):
+        image = image.resize((image_size, image_size), resampling.BILINEAR)
 
-    # ``getdata`` returns one (R, G, B) tuple per pixel in row-major order.
-    # Creating a float tensor here makes the later division and model input
-    # type explicit.  A production pipeline might use a faster conversion,
-    # but this version is easier to read for a learner.
-    pixels = torch.tensor(list(image.getdata()), dtype=torch.float32)
+    # Convert the RGB image buffer to an H x W x 3 uint8 NumPy array, then to
+    # a float tensor. The copy gives PyTorch writable, independent storage.
+    pixels = torch.from_numpy(np.asarray(image, dtype=np.uint8).copy()).to(torch.float32)
 
-    # At this point the shape is (H, W, 3), matching the way image libraries
-    # commonly expose pixels.  Conv2d expects (C, H, W), so move the channel
-    # dimension to the front.  This is exactly the C x H x W notation in the
-    # chapter; a DataLoader will add B at the front later.
-    pixels = pixels.reshape(image_size, image_size, 3).permute(2, 0, 1)
+    # At this point the shape is (H, W, 3), matching image-library convention.
+    # Conv2d expects (C, H, W), so move channels to the front. This is the
+    # chapter's C x H x W representation; DataLoader adds B at the front.
+    pixels = pixels.permute(2, 0, 1)
 
     # Normalize 8-bit pixels.  The tensor now has shape (3, image_size,
     # image_size) and is ready for a convolutional model.
@@ -140,9 +144,10 @@ class ImageFolderDataset(Dataset):
 
         tensor = image_to_tensor(image, self.image_size)
 
-        # Horizontal reflection is a simple way to show data augmentation.  It
-        # creates a slightly different view of the same class without changing
-        # the label.  ``dims=(2,)`` flips the width axis of (C, H, W).
+        # Horizontal reflection is a small training-only augmentation added to
+        # this companion example; it is separate from the CNN operations in
+        # the chapter. It creates another view of the same class. ``dims=(2,)``
+        # flips the width axis of (C, H, W).
         if self.training and torch.rand(()) < 0.5:
             tensor = torch.flip(tensor, dims=(2,))
 

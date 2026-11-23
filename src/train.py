@@ -7,7 +7,8 @@ The training script follows the chapter's complete learning loop:
     update:   optimizer uses gradients to change the shared kernels
 
 It intentionally avoids a training framework so each step remains visible.
-Run it from the repository root with ``python -m src.train --help``.
+The learning loop illustrates Chapter VI.3, Sections 15-17. Run it from the
+repository root with ``python -m src.train --help``.
 """
 
 import argparse
@@ -21,9 +22,11 @@ from torch.utils.data import DataLoader
 try:  # Works both with ``python -m src.train`` and ``python src/train.py``.
     from .cnn import SimpleCNN
     from .dataset import ImageFolderDataset
+    from .logging_utils import log, log_model_info
 except ImportError:  # pragma: no cover - only used for direct file execution.
     from cnn import SimpleCNN
     from dataset import ImageFolderDataset
+    from logging_utils import log, log_model_info
 
 
 def set_seed(seed: int) -> None:
@@ -35,8 +38,8 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def evaluate(model, loader, device):
-    """Measure average loss and accuracy without changing model parameters."""
+def evaluate(model, loader, device, num_classes):
+    """Measure loss, accuracy, and class-wise metrics on a labeled split."""
     # Evaluation must not update weights.  ``eval`` changes layers that have
     # training-specific behavior (none are essential in this tiny model, but it
     # is the correct habit), and no_grad avoids storing backward activations.
@@ -44,6 +47,7 @@ def evaluate(model, loader, device):
     correct = total = 0
     loss_total = 0.0
     criterion = nn.CrossEntropyLoss()
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64, device=device)
 
     for images, labels in loader:
         # DataLoader gives images as (B, 3, H, W) and labels as (B,).  Moving
@@ -63,10 +67,19 @@ def evaluate(model, loader, device):
 
         # argmax selects the class with the largest logit.  Softmax is not
         # needed for choosing the class because it preserves the ordering.
-        correct += (logits.argmax(dim=1) == labels).sum().item()
+        predictions = logits.argmax(dim=1)
+        correct += (predictions == labels).sum().item()
         total += labels.size(0)
+        encoded_pairs = labels * num_classes + predictions
+        confusion += torch.bincount(encoded_pairs, minlength=num_classes * num_classes).reshape(
+            num_classes, num_classes
+        )
 
-    return loss_total / total, correct / total
+    true_positives = confusion.diag().to(torch.float32)
+    precision = true_positives / confusion.sum(dim=0).clamp_min(1)
+    recall = true_positives / confusion.sum(dim=1).clamp_min(1)
+    f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-12)
+    return loss_total / total, correct / total, confusion, precision, recall, f1
 
 
 def train(args):
@@ -76,9 +89,22 @@ def train(args):
     # hardware and PyTorch backend details.
     set_seed(args.seed)
 
-    # Use a GPU if one is available unless the learner explicitly requests
-    # CPU.  The model and each batch must live on the same device.
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    # ``auto`` selects CUDA when this PyTorch installation can access it.  A
+    # CUDA-capable GPU alone is not enough: PyTorch must also be a CUDA build.
+    # The model and each batch must live on the same device.
+    if args.device == "cuda" and not torch.cuda.is_available():
+        cuda_build = torch.version.cuda or "not installed (CPU-only PyTorch)"
+        raise RuntimeError(
+            "--device cuda was requested, but PyTorch cannot access CUDA. "
+            f"torch={torch.__version__}, torch CUDA build={cuda_build}. "
+            "Install a CUDA-enabled PyTorch build and check that the NVIDIA "
+            "driver is up to date."
+        )
+
+    use_cuda = args.device == "cuda" or (
+        args.device == "auto" and torch.cuda.is_available()
+    )
+    device = torch.device("cuda" if use_cuda else "cpu")
     data_root = Path(args.data)
 
     # Each dataset reads root/class_name/image.  The training dataset may flip
@@ -103,15 +129,32 @@ def train(args):
     # expects raw logits from the model and integer labels such as cat=0/dog=1.
     criterion = nn.CrossEntropyLoss()
 
-    # SGD is intentionally chosen because it makes the chapter's update rule
-    # easy to recognize: parameter <- parameter - learning_rate * gradient.
-    # Momentum, schedulers, and other optimization improvements are omitted.
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
+    # The optimizer changes how gradients update parameters; the same
+    # forward/loss/backward loop works with SGD, Adam, or AdamW.
+    optimizer_classes = {
+        "sgd": torch.optim.SGD,
+        "adam": torch.optim.Adam,
+        "adamw": torch.optim.AdamW,
+    }
+    optimizer_class = optimizer_classes[args.optimizer]
+    optimizer = optimizer_class(model.parameters(), lr=args.learning_rate)
 
-    print(f"device={device} classes={train_set.classes} train={len(train_set)} val={len(val_set)}")
+    log(
+        f"optimizer={optimizer_class.__name__} learning_rate={args.learning_rate:g} "
+        f"epochs={args.epochs} batch_size={args.batch_size} image_size={args.image_size}"
+    )
+    if device.type == "cuda":
+        log(f"device={device} gpu={torch.cuda.get_device_name(device)}")
+    else:
+        log(f"device={device}")
+    log(f"classes={train_set.classes} train={len(train_set)} val={len(val_set)}")
     best_accuracy = -1.0
 
     for epoch in range(1, args.epochs + 1):
+        # Report progress before processing this epoch so long runs always
+        # show which epoch is currently underway.
+        log(f"epoch {epoch:02d}/{args.epochs} starting")
+
         # ``train`` enables training behavior in the model and its children.
         model.train()
         running_loss = 0.0
@@ -120,8 +163,9 @@ def train(args):
             images, labels = images.to(device), labels.to(device)
 
             # ------------------------- forward pass ----------------------
-            # The CNN produces one logit vector per image.  The shape changes
-            # inside SimpleCNN from (B, 3, 64, 64) to (B, num_classes).
+            # The CNN produces one logit vector per image. With the default
+            # 64-pixel input, its shape changes from (B, 3, 64, 64) to
+            # (B, num_classes); --image-size changes the input height and width.
             logits = model(images)
             loss = criterion(logits, labels)
 
@@ -146,12 +190,23 @@ def train(args):
 
         # Validation is a separate forward-only pass over data not used for
         # parameter updates.  It gives a simple signal about generalization.
-        val_loss, val_accuracy = evaluate(model, val_loader, device)
+        val_loss, val_accuracy, confusion, precision, recall, f1 = evaluate(
+            model, val_loader, device, len(train_set.classes)
+        )
         train_loss = running_loss / len(train_set)
-        print(
+        log(
             f"epoch {epoch:02d}/{args.epochs} "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"val_accuracy={val_accuracy:.1%}"
+            f"val_accuracy={val_accuracy:.1%} val_macro_f1={f1.mean().item():.1%}"
+        )
+        for index, class_name in enumerate(train_set.classes):
+            log(
+                f"val_class={class_name} precision={precision[index].item():.1%} "
+                f"recall={recall[index].item():.1%} f1={f1[index].item():.1%}"
+            )
+        log(
+            f"val_confusion_matrix rows=actual columns=predicted "
+            f"classes={train_set.classes} values={confusion.cpu().tolist()}"
         )
 
         # Save the best validation model rather than only the final epoch.  The
@@ -166,24 +221,39 @@ def train(args):
                     "model_state": model.state_dict(),
                     "classes": train_set.classes,
                     "image_size": args.image_size,
+                    "optimizer": args.optimizer,
+                    "learning_rate": args.learning_rate,
                 },
                 checkpoint_path,
             )
 
-    print(f"saved best checkpoint to {args.checkpoint} ({best_accuracy:.1%})")
+    log(f"training complete; best validation accuracy={best_accuracy:.1%}")
+    log_model_info(model, train_set.classes, args.image_size, device, args.checkpoint)
+    log(f"saved best checkpoint to {args.checkpoint}")
 
 
 def parse_args():
     """Define the few command-line knobs needed for a small experiment."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default="data/cats_dogs", help="folder containing train/ and val/")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=0.01)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument(
+        "--optimizer",
+        choices=("sgd", "adam", "adamw"),
+        default="adamw",
+        help="optimizer used for parameter updates (default: adamw)",
+    )
     parser.add_argument("--checkpoint", default="models/cnn_cats_dogs.pt")
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--cpu", action="store_true", help="force CPU even when CUDA is available")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="auto selects CUDA when available; cpu forces CPU; cuda requires CUDA (default: auto)",
+    )
     return parser.parse_args()
 
 

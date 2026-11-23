@@ -6,6 +6,7 @@ Inference is the chapter's forward pass without a target or an update:
 
 The checkpoint stores the class names and image size used during training so
 the inference path does not have to guess how to interpret the output vector.
+The logits-to-probabilities step follows Chapter VI.3, Section 15.
 """
 
 import argparse
@@ -15,9 +16,11 @@ import torch
 try:  # Works both with ``python -m src.infer`` and ``python src/infer.py``.
     from .cnn import SimpleCNN
     from .dataset import load_image
+    from .logging_utils import log, log_model_info
 except ImportError:  # pragma: no cover - only used for direct file execution.
     from cnn import SimpleCNN
     from dataset import load_image
+    from logging_utils import log, log_model_info
 
 
 def parse_args():
@@ -51,6 +54,12 @@ def main(args):
     # here because inference should not change the model.
     model.eval()
 
+    if device.type == "cuda":
+        log(f"loaded checkpoint; gpu={torch.cuda.get_device_name(device)}")
+    else:
+        log("loaded checkpoint")
+    log_model_info(model, classes, checkpoint["image_size"], device, args.checkpoint)
+
     # ``load_image`` returns (1, 3, H, W): one image in a batch.  The model's
     # output has shape (1, num_classes); [0] below selects that one row.
     with torch.no_grad():
@@ -65,12 +74,12 @@ def main(args):
     # The largest probability is the model's predicted class.  Converting the
     # scalar tensor to int lets us use it as a normal Python list index.
     predicted = int(probabilities.argmax())
-    print(f"prediction: {classes[predicted]} ({probabilities[predicted].item():.1%})")
+    log(f"prediction: {classes[predicted]} ({probabilities[predicted].item():.1%})")
 
     # Print every class so the learner can see the whole output distribution,
     # not only the winner selected by argmax.
     for class_name, probability in zip(classes, probabilities.tolist()):
-        print(f"  {class_name}: {probability:.1%}")
+        log(f"  {class_name}: {probability:.1%}")
 
 
 if __name__ == "__main__":

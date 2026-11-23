@@ -9,10 +9,13 @@ The code uses PyTorch's ``Conv2d`` rather than implementing convolution with
 explicit Python loops.  ``Conv2d`` still performs the same conceptual operation
 described in the chapter: each learned kernel looks at a small local window,
 and the same kernel weights are reused at every spatial position.
+PyTorch uses the deep-learning convention of applying an unflipped kernel
+(cross-correlation mathematically); see Chapter VI.3, Section 13.
 
 Useful cross-references while reading the chapter:
 
 * Sections 1-7: locality, kernels, feature maps, and feature channels.
+* Sections 13-14: local shared weights and multi-channel convolution.
 * Sections 8-11: stages, downsampling, backbone/head, and classification.
 * Sections 15-17: forward computation, loss, backpropagation, and updates.
 * Section 22: receptive fields growing through repeated local operations.
